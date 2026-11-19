@@ -47,6 +47,13 @@ export interface CanvasHandlers {
   open(id: string): void
   newSession(groupKey: string): void
   selectionChanged?(id: string | undefined): void
+  quickStop?(id: string): void
+  quickPin?(id: string): void
+  quickApprove?(id: string): void
+  quickOrchestrate?(id: string): void
+  isPinned?(id: string): boolean
+  onCameraChange?(z: number): void
+  onVisibleCount?(n: number): void
 }
 
 const STIFF = 190
@@ -109,6 +116,7 @@ export class CanvasView {
   private ro: ResizeObserver
   private tickTimer: ReturnType<typeof setInterval>
   private destroyed = false
+  private lastZoomReported = -1
   selected?: string
 
   constructor(
@@ -277,6 +285,25 @@ export class CanvasView {
     this.camera.fit(this.result.bounds, 72, 1)
   }
 
+  /** Smoothly frame a single project group on the canvas. */
+  focusGroup(groupKey: string) {
+    this.ensureLayout()
+    const r = this.result?.groups.get(groupKey)
+    if (!r) return
+    this.camera.fit(r, 84, 0.95)
+    this.kick()
+  }
+
+  /** Sync a session card's pin-to-tiles quick-action indicator. */
+  refreshPinState(id: string) {
+    const c = this.cards.get(id)
+    if (!c?.els || !this.handlers.isPinned) return
+    const pinned = this.handlers.isPinned(id)
+    c.els.pinBtn.classList.toggle("on", pinned)
+    c.els.pinBtn.title = pinned ? "Unpin from Tiles" : "Pin to Tiles"
+    c.els.pinBtn.setAttribute("aria-label", c.els.pinBtn.title)
+  }
+
   zoomBy(f: number) {
     this.camera.zoomAt(f, this.camera.viewport.w / 2, this.camera.viewport.h / 2)
   }
@@ -369,6 +396,7 @@ export class CanvasView {
       if (!c?.els) continue
       const before = c.root.dataset.status
       if (updateSessionCard(c.els, this.store, id, now)) this.heightsDirty.add(id)
+      this.refreshPinState(id)
       touchedGroups.add(c.group)
       // A status change reorders its project (and the filtered grid).
       if (before !== undefined && before !== c.root.dataset.status) {
@@ -479,6 +507,13 @@ export class CanvasView {
         this.select(undefined, false)
       }
     }
+    if (this.handlers.onVisibleCount) {
+      let shown = 0
+      for (const c of this.cards.values()) {
+        if (c.kind === "session" && c.target && c.target.interactive && c.target.opacity > 0.5) shown++
+      }
+      this.handlers.onVisibleCount(shown)
+    }
     this.renderLabels()
     this.camera.setBounds(this.result.bounds)
 
@@ -517,6 +552,16 @@ export class CanvasView {
         e = document.createElement("div")
         e.className = "group-label"
         e.innerHTML = `<span class="name"></span><span class="marks"></span><span class="count"></span>`
+        if (l.key !== "__search") {
+          const add = document.createElement("button")
+          add.type = "button"
+          add.className = "gl-add"
+          add.textContent = "+"
+          add.dataset.groupAdd = l.key
+          add.title = `New session in ${l.text}`
+          add.setAttribute("aria-label", `New session in ${l.text}`)
+          e.append(add)
+        }
         e.style.transform = `translate(${l.x}px, ${l.y}px)`
         this.labelsLayer.append(e)
         this.labels.set(l.key, e)
@@ -604,6 +649,10 @@ export class CanvasView {
       if (Math.abs(accent - this.accentH) > 0.25) {
         this.accentH = accent
         this.world.style.setProperty("--accent-h", `${accent.toFixed(1)}px`)
+      }
+      if (this.handlers.onCameraChange && Math.abs(this.camera.z - this.lastZoomReported) > 0.004) {
+        this.lastZoomReported = this.camera.z
+        this.handlers.onCameraChange(this.camera.z)
       }
       this.cameraDirty = false
     }
@@ -829,6 +878,19 @@ export class CanvasView {
       if (e.type !== "pointerup") return
       const t = e.target as Element | null
       const el = typeof Element !== "undefined" ? (t instanceof Element ? t : null) : t && typeof t.closest === "function" ? t : null
+      const qbtn = el?.closest<HTMLElement>(".card-qbtn")
+      if (qbtn?.dataset.id && qbtn.dataset.quick) {
+        if (qbtn.dataset.quick === "stop") this.handlers.quickStop?.(qbtn.dataset.id)
+        else if (qbtn.dataset.quick === "pin") this.handlers.quickPin?.(qbtn.dataset.id)
+        else if (qbtn.dataset.quick === "approve") this.handlers.quickApprove?.(qbtn.dataset.id)
+        else if (qbtn.dataset.quick === "orchestrate") this.handlers.quickOrchestrate?.(qbtn.dataset.id)
+        return
+      }
+      const addBtn = el?.closest<HTMLElement>(".gl-add")
+      if (addBtn?.dataset.groupAdd) {
+        this.handlers.newSession(addBtn.dataset.groupAdd)
+        return
+      }
       const target = el?.closest<HTMLElement>(".card")
       if (target && !target.classList.contains("inert")) this.activate(target.dataset.id!)
       else {

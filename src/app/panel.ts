@@ -29,11 +29,18 @@ export class SessionPanel {
   private autoBadge: HTMLElement
   private subBtn: HTMLButtonElement
   private stopBtn: HTMLButtonElement
+  private prevBtn: HTMLButtonElement
+  private nextBtn: HTMLButtonElement
+  private orchBtn: HTMLButtonElement
+  private pinBtn: HTMLButtonElement
   private menuBtn: HTMLButtonElement
+  private closeBtn: HTMLButtonElement
   private titleEl: HTMLElement
   private line: HTMLElement
   private transcript: Transcript
   private input: HTMLTextAreaElement
+  private sendBtn: HTMLButtonElement
+  private queueBtn: HTMLButtonElement
   private hint: HTMLElement
   private attachRow: HTMLElement
   private popover?: HTMLElement
@@ -48,6 +55,10 @@ export class SessionPanel {
   id?: string
   /** Set by the app once the tiled view exists. */
   tiles?: { isPinned(id: string): boolean; togglePin(id: string): void }
+  /** Optional rapid session triage stepper (prev / next session). */
+  onStep?: (dir: 1 | -1) => void
+  /** Optional jump straight into Orchestrate with this session focused. */
+  onOrchestrate?: (id: string) => void
   private attachments: Array<{ uri: string; name: string }> = []
   private closing = false
   private statusState = ""
@@ -97,6 +108,46 @@ export class SessionPanel {
     this.stopBtn.type = "button"
     this.stopBtn.title = "Interrupt (⌘.)"
     this.stopBtn.addEventListener("click", () => this.interrupt())
+    const navGroup = h("div", "head-step-group")
+    this.prevBtn = h("button", "head-btn step", "‹") as HTMLButtonElement
+    this.prevBtn.type = "button"
+    this.prevBtn.title = "Previous session ([)"
+    this.prevBtn.setAttribute("aria-label", "Previous session")
+    this.prevBtn.hidden = true
+    this.prevBtn.addEventListener("click", (e) => {
+      e.stopPropagation()
+      this.onStep?.(-1)
+    })
+    this.nextBtn = h("button", "head-btn step", "›") as HTMLButtonElement
+    this.nextBtn.type = "button"
+    this.nextBtn.title = "Next session (])"
+    this.nextBtn.setAttribute("aria-label", "Next session")
+    this.nextBtn.hidden = true
+    this.nextBtn.addEventListener("click", (e) => {
+      e.stopPropagation()
+      this.onStep?.(1)
+    })
+    navGroup.append(this.prevBtn, this.nextBtn)
+    this.orchBtn = h("button", "head-btn orch", "Orchestrate") as HTMLButtonElement
+    this.orchBtn.type = "button"
+    this.orchBtn.title = "Steer this session alongside others in Orchestrate (O)"
+    this.orchBtn.hidden = true
+    this.orchBtn.addEventListener("click", (e) => {
+      e.stopPropagation()
+      if (this.id) this.onOrchestrate?.(this.id)
+    })
+    this.pinBtn = h("button", "head-btn pin") as HTMLButtonElement
+    this.pinBtn.type = "button"
+    this.pinBtn.innerHTML = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 2.5l4 4-2.2.8-2.6 2.6.3 2.6-1.2 1.2-2.4-2.4L3 13.6M2.9 7.9l1.2-1.2 2.6.3 2.6-2.6z"/></svg>`
+    this.pinBtn.title = "Pin to Tiles"
+    this.pinBtn.setAttribute("aria-label", "Pin to Tiles")
+    this.pinBtn.hidden = true
+    this.pinBtn.addEventListener("click", (e) => {
+      e.stopPropagation()
+      if (!this.id || !this.tiles) return
+      this.tiles.togglePin(this.id)
+      this.renderHeader()
+    })
     this.menuBtn = h("button", "head-btn menu", "⋯") as HTMLButtonElement
     this.menuBtn.type = "button"
     this.menuBtn.setAttribute("aria-label", "Session menu")
@@ -107,7 +158,15 @@ export class SessionPanel {
       e.stopPropagation()
       this.toggleMenu()
     })
-    right.append(this.subBtn, this.stopBtn, this.menuBtn)
+    this.closeBtn = h("button", "head-btn close", "×") as HTMLButtonElement
+    this.closeBtn.type = "button"
+    this.closeBtn.title = "Close session (Esc)"
+    this.closeBtn.setAttribute("aria-label", "Close session")
+    this.closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation()
+      this.close()
+    })
+    right.append(this.subBtn, this.stopBtn, navGroup, this.orchBtn, this.pinBtn, this.menuBtn, this.closeBtn)
     this.header.append(left, right)
 
     this.titleEl = h("h1", "panel-title")
@@ -133,8 +192,23 @@ export class SessionPanel {
     this.input.rows = 1
     this.input.spellcheck = true
     this.input.setAttribute("aria-label", "Message input")
+    const actions = h("div", "composer-actions")
     this.hint = h("span", "composer-hint")
-    row.append(this.input, this.hint)
+    this.queueBtn = h("button", "composer-queue", "Queue") as HTMLButtonElement
+    this.queueBtn.type = "button"
+    this.queueBtn.title = "Queue for after the current turn (Tab)"
+    this.queueBtn.hidden = true
+    this.queueBtn.addEventListener("click", () => void this.send("queue"))
+    this.sendBtn = h("button", "composer-send", "↑") as HTMLButtonElement
+    this.sendBtn.type = "button"
+    this.sendBtn.title = "Send (Enter)"
+    this.sendBtn.setAttribute("aria-label", "Send message")
+    this.sendBtn.addEventListener("click", () => {
+      const working = this.store.running.has(this.id ?? "")
+      void this.send(working ? "steer" : undefined)
+    })
+    actions.append(this.hint, this.queueBtn, this.sendBtn)
+    row.append(this.input, actions)
     composer.append(this.attachRow, row)
     this.bindComposer()
 
@@ -157,7 +231,10 @@ export class SessionPanel {
       },
     })
     this.onResize = () => {
-      if (this.id && !this.closing) this.applyGeometry(this.targetRect(), false)
+      if (this.id && !this.closing) {
+        this.applyGeometry(this.targetRect(), false)
+        if (this.input.value) this.autosize()
+      }
     }
     window.addEventListener("resize", this.onResize)
   }
@@ -247,10 +324,14 @@ export class SessionPanel {
       }, 90)
     }
     this.transcript.setSession(id)
+    if (!this.input.value) this.input.style.height = "auto"
     this.focusTimer = setTimeout(() => {
       this.focusTimer = undefined
-      if (this.id === id && !this.closing && !matchMedia("(pointer: coarse)").matches) {
-        this.input.focus({ preventScroll: true })
+      if (this.id === id && !this.closing) {
+        if (this.input.value) this.autosize()
+        if (!matchMedia("(pointer: coarse)").matches) {
+          this.input.focus({ preventScroll: true })
+        }
       }
     }, switching ? 0 : 260)
   }
@@ -317,13 +398,34 @@ export class SessionPanel {
       ? "This session never asks for permission (⋯ menu to change)"
       : "Auto-approve is on for every session (top bar to change)"
     this.stopBtn.hidden = !working
+    const canStep = !!this.onStep && this.store.roots().length > 1
+    this.prevBtn.hidden = !canStep
+    this.nextBtn.hidden = !canStep
+    this.orchBtn.hidden = !this.onOrchestrate
+    this.pinBtn.hidden = !this.tiles
+    if (this.tiles) {
+      const pinned = this.tiles.isPinned(id)
+      this.pinBtn.classList.toggle("on", pinned)
+      this.pinBtn.title = pinned ? "Unpin from Tiles" : "Pin to Tiles"
+      this.pinBtn.setAttribute("aria-label", this.pinBtn.title)
+    }
     const n = this.store.subagentCount(id)
     this.subBtn.hidden = n === 0
     this.subBtn.textContent = `${n} subagent${n === 1 ? "" : "s"}`
     if (document.activeElement !== this.titleEl) this.titleEl.textContent = this.store.title(s)
-    this.input.placeholder = working ? "Steer…" : this.transcript.messages.length ? "Reply…" : "Ask anything…"
+    this.input.placeholder = working ? "Steer this session… (Enter to steer, Tab to queue)" : this.transcript.messages.length ? "Reply to Hermes…" : "Ask anything…"
     this.hint.textContent = working ? "Tab to queue" : ""
     this.hint.hidden = !working
+    this.queueBtn.hidden = !working
+    this.sendBtn.title = working ? "Steer (Enter)" : "Send (Enter)"
+    this.sendBtn.setAttribute("aria-label", working ? "Steer session" : "Send message")
+    this.syncComposerReady()
+  }
+
+  private syncComposerReady() {
+    const ready = !!(this.input.value.trim() || this.attachments.length)
+    this.sendBtn.classList.toggle("ready", ready)
+    this.queueBtn.classList.toggle("ready", ready)
   }
 
 
@@ -628,7 +730,10 @@ export class SessionPanel {
 
   private bindComposer() {
     const input = this.input
-    input.addEventListener("input", () => this.autosize())
+    input.addEventListener("input", () => {
+      this.autosize()
+      this.syncComposerReady()
+    })
     input.addEventListener("keydown", (e) => {
       e.stopPropagation()
       if (e.isComposing) return
@@ -703,6 +808,7 @@ export class SessionPanel {
       }),
     )
     this.attachRow.hidden = !this.attachments.length
+    this.syncComposerReady()
   }
 
   private async send(delivery: "steer" | "queue" | undefined) {
@@ -722,6 +828,7 @@ export class SessionPanel {
     this.input.style.height = "auto"
     this.attachments = []
     this.renderAttachments()
+    this.syncComposerReady()
     // Optimistic: show it as pending until the server confirms.
     const temp: InboxItem = {
       id: `local_${Date.now()}`,

@@ -10,13 +10,14 @@
 import type { Backend } from "./backend"
 import { basename } from "./format"
 import { launchPrompt, missionLabel, parseMention } from "./launch"
-import { defaultModel, modelLabel } from "./models"
+import { defaultModel, modelLabel, models, setDefaultModel } from "./models"
 import { ALLOW_ALL, STATUS_LABEL, type Store } from "./store"
 import { toast } from "./toast"
 
 const MISSIONS_KEY = "hermes-canvas.missions"
 const TEAM_KEY = "hermes-canvas.launch.team"
 const DIR_KEY = "hermes-canvas.launch.dir"
+const COLLAPSE_KEY = "hermes-canvas.launch.collapsed"
 const MAX_MISSIONS = 8
 
 interface Mission {
@@ -113,9 +114,13 @@ export class Launchpad {
   private sendBtn: HTMLButtonElement
   private destBtn: HTMLButtonElement
   private destLabel: HTMLElement
+  private modelBtn: HTMLButtonElement
+  private modelLabelEl: HTMLElement
   private modeBtn: HTMLButtonElement
+  private collapseBtn: HTMLButtonElement
   private note: HTMLElement
   private menu?: HTMLElement
+  private menuKind?: "dest" | "model"
   private menuOutside?: (e: PointerEvent) => void
   private menuOutsideTimer?: ReturnType<typeof setTimeout>
   private unsub: () => void
@@ -124,6 +129,13 @@ export class Launchpad {
   private team = readTeam()
   private directory = readDir()
   private pinned = this.directory !== undefined
+  private collapsed = (() => {
+    try {
+      return localStorage.getItem(COLLAPSE_KEY) === "1"
+    } catch {
+      return false
+    }
+  })()
   private busy = false
 
   constructor(
@@ -157,13 +169,31 @@ export class Launchpad {
     this.destLabel = h("span", "ld-label")
     this.destBtn.append(this.destLabel, caret)
     this.destBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
-    this.destBtn.addEventListener("click", () => (this.menu ? this.closeMenu() : this.openDest()))
+    this.destBtn.addEventListener("click", () => (this.menu && this.menuKind === "dest" ? this.closeMenu() : this.openDest()))
+
+    this.modelBtn = h("button", "launch-model") as HTMLButtonElement
+    this.modelBtn.type = "button"
+    this.modelBtn.title = "Default model for newly launched sessions"
+    this.modelBtn.setAttribute("aria-haspopup", "dialog")
+    this.modelBtn.setAttribute("aria-expanded", "false")
+    this.modelLabelEl = h("span", "lm-name")
+    const mCaret = h("span", "ld-caret", "▾")
+    mCaret.setAttribute("aria-hidden", "true")
+    this.modelBtn.append(this.modelLabelEl, mCaret)
+    this.modelBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
+    this.modelBtn.addEventListener("click", () => (this.menu && this.menuKind === "model" ? this.closeMenu() : void this.openModels()))
 
     this.modeBtn = h("button", "launch-mode") as HTMLButtonElement
     this.modeBtn.type = "button"
     this.modeBtn.addEventListener("click", () => this.setTeam(!this.team))
 
-    controls.append(this.destBtn, h("span", "launch-spacer"), this.modeBtn)
+    this.collapseBtn = h("button", "launch-collapse", "–") as HTMLButtonElement
+    this.collapseBtn.type = "button"
+    this.collapseBtn.title = "Minimize launchpad (L to expand)"
+    this.collapseBtn.setAttribute("aria-label", "Minimize launchpad")
+    this.collapseBtn.addEventListener("click", () => this.setCollapsed(!this.collapsed))
+
+    controls.append(this.destBtn, this.modelBtn, h("span", "launch-spacer"), this.modeBtn, this.collapseBtn)
 
     const row = h("div", "launch-row")
     this.input = h("textarea", "launch-input") as HTMLTextAreaElement
@@ -218,11 +248,24 @@ export class Launchpad {
 
   /** Focus the task box (the `L` shortcut). */
   focus() {
+    if (this.collapsed) this.setCollapsed(false)
     this.input.focus()
   }
 
   /** Repaint the destination chip after the canvas selection changes. */
   refreshDestination() {
+    this.refresh()
+  }
+
+  /** Repaint the model chip after the default model changes elsewhere. */
+  refreshModel() {
+    this.refresh()
+  }
+
+  private setCollapsed(collapsed: boolean) {
+    this.collapsed = collapsed
+    write(COLLAPSE_KEY, collapsed ? "1" : "0")
+    if (collapsed) this.closeMenu()
     this.refresh()
   }
 
@@ -251,20 +294,27 @@ export class Launchpad {
   private refresh() {
     const dir = this.currentDir()
     const label = this.destLabelFor(dir)
+    const modelText = modelLabel(defaultModel(this.backend.kind))
     this.destLabel.textContent = label
     this.destBtn.title = `${dir || "Choose a project"} · click to change`
+    this.modelLabelEl.textContent = modelText
+    this.modelBtn.title = `Model: ${modelText} · click to switch`
     this.modeBtn.classList.toggle("on", this.team)
     this.modeBtn.textContent = this.team ? "Team" : "Solo"
     this.modeBtn.setAttribute("aria-pressed", String(this.team))
     this.modeBtn.title = this.team
       ? "Team: the lead session splits the task into subagents with delegate_task (parallel, more tokens)"
       : "Solo: one session with no subagents"
+    this.el.classList.toggle("collapsed", this.collapsed)
+    this.collapseBtn.textContent = this.collapsed ? "+" : "–"
+    this.collapseBtn.title = this.collapsed ? "Expand launchpad (L)" : "Minimize launchpad"
+    this.collapseBtn.setAttribute("aria-label", this.collapsed ? "Expand launchpad" : "Minimize launchpad")
     this.input.placeholder = this.team
-      ? "Describe a task. Enter launches a team of Hermes subagents."
-      : "Describe a task. Enter launches one Hermes session."
+      ? "Describe a task (@project) — Enter launches a team"
+      : "Describe a task (@project) — Enter launches a session"
     this.note.textContent = this.team
-      ? `Enter launches a team · ${modelLabel(defaultModel(this.backend.kind))} · Shift+Enter for a new line`
-      : `Enter launches one session · ${modelLabel(defaultModel(this.backend.kind))} · Shift+Enter for a new line`
+      ? `Enter launches a team · ${modelText} · Shift+Enter for a new line`
+      : `Enter launches one session · ${modelText} · Shift+Enter for a new line`
     this.renderFeed()
   }
 
@@ -423,7 +473,7 @@ export class Launchpad {
   // ---- destination menu -----------------------------------------------------
 
   private openDest() {
-    if (this.menu) return this.closeMenu()
+    if (this.menu) this.closeMenu()
 
     const menu = h("div", "launch-menu")
     menu.setAttribute("role", "dialog")
@@ -442,6 +492,7 @@ export class Launchpad {
     menu.append(input, err, list)
     this.box.append(menu)
     this.menu = menu
+    this.menuKind = "dest"
     this.destBtn.setAttribute("aria-expanded", "true")
 
     let options: DestOption[] = []
@@ -584,6 +635,133 @@ export class Launchpad {
     menu.addEventListener("pointerdown", (e) => e.stopPropagation())
   }
 
+  private async openModels() {
+    if (this.menu) this.closeMenu()
+    if (this.collapsed) this.setCollapsed(false)
+
+    const menu = h("div", "launch-menu launch-model-menu")
+    menu.setAttribute("role", "dialog")
+    menu.setAttribute("aria-label", "Choose default model")
+    const input = h("input", "launch-menu-input") as HTMLInputElement
+    input.placeholder = "Search models"
+    input.setAttribute("aria-label", "Search models")
+    input.autocomplete = "off"
+    input.spellcheck = false
+    const list = h("div", "launch-menu-list")
+    list.setAttribute("role", "listbox")
+    list.setAttribute("aria-label", "Models")
+    list.append(h("div", "launch-menu-empty", "Loading models…"))
+    menu.append(input, list)
+    this.box.append(menu)
+    this.menu = menu
+    this.menuKind = "model"
+    this.modelBtn.setAttribute("aria-expanded", "true")
+
+    const outside = (e: PointerEvent) => {
+      if (this.menu && !this.menu.contains(e.target as Node)) this.closeMenu()
+    }
+    this.menuOutside = outside
+    this.menuOutsideTimer = setTimeout(() => {
+      this.menuOutsideTimer = undefined
+      if (this.menu === menu) document.addEventListener("pointerdown", outside)
+    }, 0)
+    menu.addEventListener("pointerdown", (e) => e.stopPropagation())
+    input.focus()
+
+    let all: Awaited<ReturnType<typeof models>>
+    try {
+      all = await models(this.backend)
+    } catch (e) {
+      if (this.menu === menu) list.replaceChildren(h("div", "launch-menu-empty", `Couldn't list models: ${(e as Error).message}`))
+      return
+    }
+    if (this.menu !== menu) return
+
+    let active = 0
+    let hits = all
+    const cur = defaultModel(this.backend.kind)
+    const curKey = cur ? `${cur.providerID}/${cur.id}` : ""
+
+    const paint = () => {
+      list.replaceChildren()
+      if (!hits.length) {
+        list.append(h("div", "launch-menu-empty", "No matching models"))
+        return
+      }
+      active = Math.min(active, hits.length - 1)
+      hits.forEach((m, i) => {
+        const key = `${m.providerID}/${m.id}`
+        const isCurrent = key === curKey
+        const b = h("button", `launch-menu-item${i === active ? " active" : ""}${isCurrent ? " current" : ""}`) as HTMLButtonElement
+        b.type = "button"
+        b.tabIndex = -1
+        b.setAttribute("role", "option")
+        b.setAttribute("aria-selected", String(i === active))
+        const mark = h("span", "lmi-mark", isCurrent ? "●" : "○")
+        mark.setAttribute("aria-hidden", "true")
+        b.append(mark, h("span", "lmi-label", m.name), h("span", "lmi-sub", key))
+        b.addEventListener("pointerenter", () => {
+          active = i
+          for (const [j, el] of [...list.children].entries()) {
+            el.classList.toggle("active", j === i)
+            el.setAttribute("aria-selected", String(j === i))
+          }
+        })
+        b.addEventListener("click", () => {
+          setDefaultModel({ id: m.id, providerID: m.providerID })
+          this.refresh()
+          this.closeMenu()
+          this.input.focus()
+        })
+        list.append(b)
+      })
+      list.children[active]?.scrollIntoView({ block: "nearest" })
+    }
+
+    const collect = (q: string) => {
+      const terms = q.trim().toLowerCase().split(/\s+/).filter(Boolean)
+      hits = all
+        .filter((m) => {
+          const hay = `${m.providerID}/${m.id} ${m.name}`.toLowerCase()
+          return terms.every((t) => hay.includes(t))
+        })
+        .slice(0, 60)
+      if (!terms.length) {
+        const idx = hits.findIndex((m) => `${m.providerID}/${m.id}` === curKey)
+        active = idx >= 0 ? idx : 0
+      } else {
+        active = 0
+      }
+      paint()
+    }
+
+    input.addEventListener("input", () => collect(input.value))
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation()
+      if (e.isComposing || e.keyCode === 229) return
+      if (e.key === "Escape") {
+        e.preventDefault()
+        this.closeMenu()
+        this.input.focus()
+      } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault()
+        if (!hits.length) return
+        active = (active + (e.key === "ArrowDown" ? 1 : -1) + hits.length) % hits.length
+        paint()
+      } else if (e.key === "Enter") {
+        e.preventDefault()
+        const m = hits[active]
+        if (m) {
+          setDefaultModel({ id: m.id, providerID: m.providerID })
+          this.refresh()
+          this.closeMenu()
+          this.input.focus()
+        }
+      }
+    })
+    collect("")
+  }
+
   private closeMenu() {
     const menu = this.menu
     if (!menu) return
@@ -595,7 +773,9 @@ export class Launchpad {
     this.menuOutside = undefined
     menu.remove()
     this.menu = undefined
+    this.menuKind = undefined
     this.destBtn.setAttribute("aria-expanded", "false")
+    this.modelBtn.setAttribute("aria-expanded", "false")
   }
 
   private expand(q: string) {

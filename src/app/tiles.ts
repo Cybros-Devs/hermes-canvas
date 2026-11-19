@@ -90,6 +90,8 @@ class Tile {
   private pinBtn: HTMLButtonElement
   private maxBtn: HTMLButtonElement
   private input: HTMLTextAreaElement
+  private queueBtn: HTMLButtonElement
+  private sendBtn: HTMLButtonElement
   private hint: HTMLElement
   private state = ""
   private ac = new AbortController()
@@ -139,8 +141,28 @@ class Tile {
     const composer = h("div", "tile-composer")
     this.input = h("textarea", "tile-input") as HTMLTextAreaElement
     this.input.rows = 1
+    this.input.setAttribute("aria-label", "Message input")
+    const cActions = h("div", "tile-composer-actions")
     this.hint = h("span", "tile-hint")
-    composer.append(this.input, this.hint)
+    this.queueBtn = h("button", "tile-queue", "Queue") as HTMLButtonElement
+    this.queueBtn.type = "button"
+    this.queueBtn.title = "Queue for after the current turn (Tab)"
+    this.queueBtn.hidden = true
+    this.queueBtn.addEventListener("click", () => void this.send("queue"), { signal: this.ac.signal } as AddEventListenerOptions)
+    this.sendBtn = h("button", "tile-send", "↑") as HTMLButtonElement
+    this.sendBtn.type = "button"
+    this.sendBtn.title = "Send (Enter)"
+    this.sendBtn.setAttribute("aria-label", "Send message")
+    this.sendBtn.addEventListener(
+      "click",
+      () => {
+        const running = this.store.running.has(this.id)
+        void this.send(running ? "steer" : undefined)
+      },
+      { signal: this.ac.signal } as AddEventListenerOptions,
+    )
+    cActions.append(this.hint, this.queueBtn, this.sendBtn)
+    composer.append(this.input, cActions)
     this.bindComposer()
 
     this.root.append(head, this.transcript.scroller, composer)
@@ -219,6 +241,16 @@ class Tile {
     }
     this.input.placeholder = working ? "Steer…" : "Reply…"
     this.hint.textContent = working ? "Tab to queue" : ""
+    this.queueBtn.hidden = !working
+    this.sendBtn.title = working ? "Steer (Enter)" : "Send (Enter)"
+    this.sendBtn.setAttribute("aria-label", working ? "Steer session" : "Send message")
+    this.syncReady()
+  }
+
+  private syncReady() {
+    const ready = !!this.input.value.trim()
+    this.sendBtn.classList.toggle("ready", ready)
+    this.queueBtn.classList.toggle("ready", ready)
   }
 
   private autosize() {
@@ -228,7 +260,14 @@ class Tile {
 
   private bindComposer() {
     const input = this.input
-    input.addEventListener("input", () => this.autosize(), { signal: this.ac.signal } as AddEventListenerOptions)
+    input.addEventListener(
+      "input",
+      () => {
+        this.autosize()
+        this.syncReady()
+      },
+      { signal: this.ac.signal } as AddEventListenerOptions,
+    )
     input.addEventListener(
       "keydown",
       (e) => {
@@ -256,6 +295,7 @@ class Tile {
     if (!text) return
     this.input.value = ""
     this.input.style.height = "auto"
+    this.syncReady()
     const temp: InboxItem = { id: `local_${Date.now()}`, sessionID: this.id, type: "user", payload: { text }, delivery: delivery ?? "steer" }
     this.transcript.addPending(temp)
     try {
@@ -290,6 +330,8 @@ export class TilesView {
   private countsEl: HTMLElement
   private empty: HTMLElement
   private subsToggle: HTMLInputElement
+  private approveAllBtn: HTMLButtonElement
+  private dismissDoneBtn: HTMLButtonElement
   private tiles = new Map<string, Tile>()
   private pins = new Set<string>(load<string[]>(PINS_KEY, []))
   /** Sessions shown here this visit: they linger as "to review" when done. */
@@ -310,7 +352,13 @@ export class TilesView {
     host: HTMLElement,
     private store: Store,
     private backend: Backend,
-    private handlers: { openOnCanvas(id: string): void; newSession(): void; closed(): void },
+    private handlers: {
+      openOnCanvas(id: string): void
+      openOrchestrator?(): void
+      newSession(): void
+      closed(): void
+      onPinChange?(id: string): void
+    },
   ) {
     this.el = h("section", "tiles-view")
     this.el.setAttribute("aria-label", "Tiled sessions")
@@ -334,6 +382,25 @@ export class TilesView {
       { signal: this.ac.signal } as AddEventListenerOptions,
     )
     subs.append(this.subsToggle, document.createTextNode(" Subagents"))
+    this.approveAllBtn = h("button", "tiles-btn approve-all", "Approve all") as HTMLButtonElement
+    this.approveAllBtn.type = "button"
+    this.approveAllBtn.hidden = true
+    this.approveAllBtn.title = "Approve every waiting Hermes permission request once"
+    this.approveAllBtn.addEventListener(
+      "click",
+      () => {
+        void this.store.approveAllPending().then(
+          (n) => toast(n ? `Approved ${n} waiting request${n === 1 ? "" : "s"}` : "No waiting requests"),
+          (err) => toast((err as Error).message),
+        )
+      },
+      { signal: this.ac.signal } as AddEventListenerOptions,
+    )
+    this.dismissDoneBtn = h("button", "tiles-btn dismiss-done", "Dismiss finished") as HTMLButtonElement
+    this.dismissDoneBtn.type = "button"
+    this.dismissDoneBtn.hidden = true
+    this.dismissDoneBtn.title = "Mark finished tiles as reviewed and dismiss them"
+    this.dismissDoneBtn.addEventListener("click", () => this.dismissFinished(), { signal: this.ac.signal } as AddEventListenerOptions)
     const newBtn = h("button", "tiles-btn", "+ New session") as HTMLButtonElement
     newBtn.type = "button"
     newBtn.addEventListener("click", () => this.handlers.newSession(), { signal: this.ac.signal } as AddEventListenerOptions)
@@ -341,7 +408,24 @@ export class TilesView {
     back.type = "button"
     back.title = "Back to the canvas (Esc)"
     back.addEventListener("click", () => this.close(), { signal: this.ac.signal } as AddEventListenerOptions)
-    tools.append(subs, autoApproveToggle(store, { signal: this.ac.signal }), newBtn, back)
+    const orchBtn = this.handlers.openOrchestrator
+      ? (() => {
+          const b = h("button", "tiles-btn", "Orchestrate") as HTMLButtonElement
+          b.type = "button"
+          b.title = "Control multiple sessions from one unified chat (O)"
+          b.addEventListener("click", () => this.handlers.openOrchestrator?.(), { signal: this.ac.signal } as AddEventListenerOptions)
+          return b
+        })()
+      : undefined
+    tools.append(
+      subs,
+      this.approveAllBtn,
+      this.dismissDoneBtn,
+      autoApproveToggle(store, { signal: this.ac.signal }),
+      newBtn,
+      ...(orchBtn ? [orchBtn] : []),
+      back,
+    )
     bar.append(title, tools)
 
     this.grid = h("div", "tiles-grid")
@@ -424,7 +508,22 @@ export class TilesView {
     else this.pins.add(id)
     save(PINS_KEY, [...this.pins])
     this.tiles.get(id)?.update()
+    this.handlers.onPinChange?.(id)
     this.queueSync()
+  }
+
+  dismissFinished() {
+    const now = Date.now()
+    let count = 0
+    for (const id of [...this.tiles.keys()]) {
+      if (this.pins.has(id)) continue
+      const st = this.store.status(id, now)
+      if (st !== "working" && st !== "needs-you") {
+        this.dismiss(id)
+        count++
+      }
+    }
+    if (count) toast(`Dismissed ${count} finished tile${count === 1 ? "" : "s"}`)
   }
 
   pin(id: string) {
@@ -540,6 +639,17 @@ export class TilesView {
     if (c.working) parts.push(`<span class="tc working">${c.working} working</span>`)
     if (c.review) parts.push(`<span class="tc review">${c.review} to review</span>`)
     this.countsEl.innerHTML = parts.join("")
+    let dismissible = 0
+    for (const id of this.tiles.keys()) {
+      if (this.pins.has(id)) continue
+      const st = this.store.status(id, now)
+      if (st !== "working" && st !== "needs-you") dismissible++
+    }
+    const waitingPerms = this.store.pendingPermissionCount()
+    this.approveAllBtn.hidden = waitingPerms === 0
+    this.approveAllBtn.textContent = waitingPerms > 1 ? `Approve all (${waitingPerms})` : "Approve (1)"
+    this.dismissDoneBtn.hidden = dismissible === 0
+    this.dismissDoneBtn.textContent = dismissible > 1 ? `Dismiss finished (${dismissible})` : "Dismiss finished"
     const n = this.tiles.size
     this.empty.hidden = n > 0
     if (!n)

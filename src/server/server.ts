@@ -474,6 +474,7 @@ export async function startServer(opts: ServerOptions) {
     development: opts.dev ? { hmr: true, console: false } : false,
     routes: {
       "/": index,
+      "/orchestrate": index,
       "/canvas/config": (req) => {
         const url = parseReqUrl(req)
         if (!url) return new Response("Bad Request", { status: 400 })

@@ -8,6 +8,9 @@ import { defaultModel } from "./models"
 import { SessionPanel } from "./panel"
 import { NewSessionPicker } from "./picker"
 import { Launchpad } from "./launchpad"
+import { OrchestratorView } from "./orchestrator"
+import { CommandPalette, type PaletteActionEntry } from "./palette"
+import { findAdjacentSessionId, orderSessionsForTriage } from "./palette-logic"
 import { TilesView } from "./tiles"
 import { autoApproveToggle, autoApprovedNotices } from "./approve"
 import pipMark from "../../assets/pip.svg"
@@ -15,6 +18,13 @@ import { WALLPAPER_IDS, WALLPAPER_LABELS, applyWallpaper, loadWallpaper, saveWal
 import { SPINNERS, setSpinnerStyle, spinner, type SpinnerStyle } from "./spinners"
 import { ALLOW_ALL, STATUS_LABEL, Store, type Status } from "./store"
 import { toast } from "./toast"
+import {
+  activeFilterSummary,
+  buildAttentionQueue,
+  formatZoomPercent,
+  nextAttentionId,
+  summarizeProjectGroups,
+} from "./ux-helpers"
 
 export interface CanvasConfig {
   mode: "live" | "demo"
@@ -138,6 +148,7 @@ export interface BootHandle {
   canvas: CanvasView
   panel: SessionPanel
   tiles: TilesView
+  orchestrator: OrchestratorView
   picker: NewSessionPicker
   launchpad: Launchpad
   destroy(): void
@@ -170,11 +181,57 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
 
   let destroyed = false
   let panel: SessionPanel
+  let tiles: TilesView
+  let orchestrator: OrchestratorView
   let launchpad: Launchpad | undefined
+  let visibleSessionCount = 0
+  let zoomReadout: HTMLButtonElement | undefined
+  let updateFilterBanner = () => {}
   const canvas = new CanvasView(root, store, {
     open: (id) => openSession(id),
     newSession: (group) => void newSession(group),
     selectionChanged: () => launchpad?.refreshDestination(),
+    quickStop: (id) => {
+      void backend.interrupt(id).then(
+        () => toast("Stopping session…"),
+        (err) => toast((err as Error).message),
+      )
+    },
+    quickPin: (id) => {
+      tiles.togglePin(id)
+      toast(tiles.isPinned(id) ? "Pinned to Tiles" : "Unpinned from Tiles")
+    },
+    quickApprove: (id) => {
+      const own = store.permissions.get(id)?.[0]
+      let childPerm = undefined
+      if (!own) {
+        for (const c of store.children.get(id) ?? []) {
+          const p = store.permissions.get(c)?.[0]
+          if (p) {
+            childPerm = p
+            break
+          }
+        }
+      }
+      const req = own ?? childPerm
+      if (!req) return
+      const s = store.sessions.get(id)
+      void store.approve(req).then(
+        () => toast(`Approved ${s ? store.title(s) : "request"}`),
+        (err) => toast((err as Error).message),
+      )
+    },
+    quickOrchestrate: (id) => {
+      openOrchestrator(id)
+    },
+    isPinned: (id) => tiles?.isPinned(id) ?? false,
+    onCameraChange: (z) => {
+      if (zoomReadout) zoomReadout.textContent = formatZoomPercent(z)
+    },
+    onVisibleCount: (n) => {
+      visibleSessionCount = n
+      updateFilterBanner()
+    },
   })
   canvas.setLayout(layoutName)
   root.dataset.layout = layoutName
@@ -184,7 +241,8 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
   panel = new SessionPanel(root, store, backend, canvas, () => {
     if (destroyed) return
     root.classList.remove("panel-open")
-    if (!tiles.isOpen && location.hash && location.hash !== "#tiles") {
+    launchpad?.refreshModel()
+    if (!tiles.isOpen && !orchestrator.isOpen && location.hash && location.hash !== "#tiles" && location.hash !== "#orchestrate") {
       history.replaceState(null, "", location.pathname + location.search)
     }
   })
@@ -194,12 +252,14 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     if (helpEl) toggleHelp()
     if (picker.isOpen) picker.close(false)
     if (tiles.isOpen) tiles.close()
+    if (orchestrator.isOpen) orchestrator.close()
+    closeStylePop()
     const from = canvas.cardRect(id)
     canvas.select(id, false)
     canvas.centerOn(id, Math.max(0.9, Math.min(1, canvas.camera.z)))
     root.classList.add("panel-open")
     panel.open(id, from)
-    history.replaceState(null, "", `#${id}`)
+    history.replaceState(null, "", `/${location.search}#${id}`)
   }
 
   async function newSession(groupKey: string) {
@@ -213,6 +273,7 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
       if (destroyed) return
       store.sessions.set(s.id, s)
       store.markStructure()
+      launchpad?.refreshModel()
       // Wait a frame for the card to exist, then open it.
       requestAnimationFrame(() => requestAnimationFrame(() => openSession(s.id)))
     } catch (e) {
@@ -220,12 +281,14 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     }
   }
 
-  const tiles = new TilesView(root, store, backend, {
+  tiles = new TilesView(root, store, backend, {
     openOnCanvas: (id) => requestAnimationFrame(() => openSession(id)),
+    openOrchestrator: () => openOrchestrator(),
     newSession: () => openPicker(),
+    onPinChange: (id) => canvas.refreshPinState(id),
     closed: () => {
       updateStats()
-      if (location.hash === "#tiles") history.replaceState(null, "", location.pathname + location.search)
+      if (!orchestrator.isOpen && location.hash === "#tiles") history.replaceState(null, "", location.pathname + location.search)
     },
   })
   panel.tiles = tiles
@@ -233,10 +296,176 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     if (helpEl) toggleHelp()
     if (picker.isOpen) picker.close(false)
     if (panel.isOpen) panel.close()
+    if (orchestrator.isOpen) orchestrator.close()
+    closeStylePop()
     tiles.open()
-    history.replaceState(null, "", "#tiles")
+    history.replaceState(null, "", `/${location.search}#tiles`)
     updateStats()
   }
+
+  orchestrator = new OrchestratorView(root, store, backend, {
+    openCanvas: () => {
+      if (location.pathname === "/orchestrate" || location.hash === "#orchestrate") {
+        history.replaceState(null, "", `/${location.search}`)
+      }
+      updateStats()
+    },
+    openTiles: () => openTiles(),
+    openSessionOnCanvas: (id) => requestAnimationFrame(() => openSession(id)),
+    openNewPicker: () => openPicker(),
+    closed: () => {
+      updateStats()
+      if (!tiles.isOpen && (location.pathname === "/orchestrate" || location.hash === "#orchestrate")) {
+        history.replaceState(null, "", `/${location.search}`)
+      }
+    },
+  })
+  function openOrchestrator(focusSessionId?: string) {
+    if (helpEl) toggleHelp()
+    if (picker.isOpen) picker.close(false)
+    if (panel.isOpen) panel.close()
+    if (tiles.isOpen) tiles.close()
+    closeStylePop()
+    if (focusSessionId) orchestrator.focusSession(focusSessionId)
+    else orchestrator.open()
+    history.replaceState(null, "", `/orchestrate${location.search}`)
+    updateStats()
+  }
+
+  panel.onOrchestrate = (id) => openOrchestrator(id)
+  panel.onStep = (dir) => {
+    const now = Date.now()
+    const ordered = orderSessionsForTriage(
+      store.roots().map((s) => ({
+        id: s.id,
+        title: store.title(s),
+        projectLabel: store.projectLabel(s),
+        directory: s.location.directory,
+        status: store.status(s.id, now),
+        updated: s.time.updated,
+        subagents: store.subagentCount(s.id),
+      })),
+    )
+    const next = findAdjacentSessionId(ordered, panel.id, dir)
+    if (next && next !== panel.id) openSession(next)
+  }
+
+  const palette = new CommandPalette(root, store, {
+    openSession: (id) => openSession(id),
+    focusProject: (groupKey) => {
+      if (tiles.isOpen) tiles.close()
+      if (orchestrator.isOpen) orchestrator.close()
+      if (panel.isOpen) panel.close()
+      if (canvas.filter) setFilter(undefined)
+      if (searchInput.value) {
+        searchInput.value = ""
+        search.classList.remove("has-value")
+        root.classList.remove("searching")
+        canvas.setQuery("")
+        updateFilterBanner()
+      }
+      canvas.focusGroup(groupKey)
+    },
+    getActions: (): PaletteActionEntry[] => {
+      const waiting = store.pendingPermissionCount()
+      const acts: PaletteActionEntry[] = []
+      if (waiting > 0) {
+        acts.push({
+          id: "approve-all",
+          label: `Approve all waiting permissions (${waiting})`,
+          detail: "Allow every blocked Hermes tool request once",
+          keywords: ["allow", "permission", "unblock", "ask"],
+          boost: 45,
+          run: () => {
+            void store.approveAllPending().then(
+              (n) => toast(n ? `Approved ${n} waiting request${n === 1 ? "" : "s"}` : "No waiting requests"),
+              (err) => toast((err as Error).message),
+            )
+          },
+        })
+      }
+      acts.push(
+        {
+          id: "orchestrate",
+          label: orchestrator.isOpen ? "Return to Canvas" : "Open Orchestrate",
+          detail: orchestrator.isOpen ? "Go back to the spatial session canvas" : "Control multiple Hermes sessions from one unified chat",
+          shortcut: "O",
+          keywords: ["fleet", "multi", "broadcast", "chat"],
+          boost: 22,
+          run: () => (orchestrator.isOpen ? orchestrator.close() : openOrchestrator()),
+        },
+        {
+          id: "tiles",
+          label: tiles.isOpen ? "Close Tiles" : "Open Live Tiles",
+          detail: "Every active session's transcript side by side",
+          shortcut: "T",
+          keywords: ["grid", "split", "live"],
+          boost: 18,
+          run: () => (tiles.isOpen ? tiles.close() : openTiles()),
+        },
+        {
+          id: "new-session",
+          label: "New Hermes session",
+          detail: "Pick a project folder and start a fresh session",
+          shortcut: "N",
+          keywords: ["create", "spawn", "start"],
+          boost: 16,
+          run: () => openPicker(),
+        },
+        {
+          id: "fit-all",
+          label: "Fit all projects on canvas",
+          detail: "Reset camera zoom to see every project cluster",
+          shortcut: "0",
+          keywords: ["zoom", "reset", "overview"],
+          boost: 10,
+          run: () => {
+            if (tiles.isOpen) tiles.close()
+            if (orchestrator.isOpen) orchestrator.close()
+            if (panel.isOpen) panel.close()
+            canvas.fitAll()
+          },
+        },
+        {
+          id: "auto-approve",
+          label: store.autoApproveAll ? "Turn off Auto-approve" : "Turn on Auto-approve",
+          detail: "Toggle automatic approval for Hermes tool requests",
+          keywords: ["yolo", "permissions", "allow"],
+          boost: 8,
+          run: () => {
+            const next = !store.autoApproveAll
+            store.setAutoApproveAll(next)
+            toast(next ? "Auto-approve enabled" : "Auto-approve disabled")
+          },
+        },
+        {
+          id: "layout-tree",
+          label: "Layout: Tree",
+          detail: "Group sessions in project columns",
+          shortcut: "4",
+          keywords: ["layout", "columns"],
+          run: () => setLayout("tree"),
+        },
+        {
+          id: "layout-fold",
+          label: "Layout: Fold",
+          detail: "Stack each project into a compact deck",
+          shortcut: "2",
+          keywords: ["layout", "stack"],
+          run: () => setLayout("fold"),
+        },
+        {
+          id: "layout-satellites",
+          label: "Layout: Satellites",
+          detail: "Orbit sessions around each project hub",
+          shortcut: "1",
+          keywords: ["layout", "orbit"],
+          run: () => setLayout("satellites"),
+        },
+      )
+      return acts
+    },
+  })
 
   const userHome = demo ? "/Users/you" : (cfg.userHome ?? cfg.home)
   const picker = new NewSessionPicker(root, store, backend, userHome, createIn)
@@ -256,7 +485,7 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     },
     openSession: (id) => openSession(id),
   })
-  ;(window as any).hermesCanvas = { canvas, store, launchpad }
+  ;(window as any).hermesCanvas = { canvas, store, launchpad, orchestrator }
 
   // ---- chrome ----
 
@@ -322,27 +551,54 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     }
     markAll.hidden = st !== "review"
     root.classList.toggle("filtering", !!st)
+    updateFilterBanner()
   }
 
   const search = el("label", "search")
   search.innerHTML = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.4 10.4 14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`
   const searchInput = el("input") as HTMLInputElement
   searchInput.type = "search"
-  searchInput.placeholder = "Search"
+  searchInput.placeholder = "Search sessions…"
   searchInput.setAttribute("aria-label", "Search sessions")
   searchInput.autocomplete = "off"
   searchInput.spellcheck = false
-  search.append(searchInput)
+  const searchKbd = el("kbd", "search-kbd", "/")
+  searchKbd.setAttribute("aria-hidden", "true")
+  const searchClear = el("button", "search-clear", "×") as HTMLButtonElement
+  searchClear.type = "button"
+  searchClear.title = "Clear search (Esc)"
+  searchClear.setAttribute("aria-label", "Clear search")
+  searchClear.addEventListener("click", (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    searchInput.value = ""
+    search.classList.remove("has-value")
+    root.classList.remove("searching")
+    canvas.setQuery("")
+    updateFilterBanner()
+    searchInput.focus()
+  })
+  search.append(searchInput, searchKbd, searchClear)
 
   const right = el("div", "top-right")
   if (demo) right.append(el("span", "badge", "Simulated"))
+  const orchLink = el("a", "orch-open-btn") as HTMLAnchorElement
+  orchLink.href = `/orchestrate${location.search}`
+  orchLink.innerHTML = `<span class="orch-icon" aria-hidden="true">⌘</span><span class="orch-label">Orchestrate</span>`
+  orchLink.title = "Centralized multi-session orchestration chat (O)"
+  orchLink.addEventListener("click", (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    e.preventDefault()
+    if (orchestrator.isOpen) orchestrator.close()
+    else openOrchestrator()
+  })
   const tilesBtn = el("button", "tiles-open-btn") as HTMLButtonElement
   tilesBtn.type = "button"
   tilesBtn.innerHTML = `<span class="tiles-icon" aria-hidden="true"></span><span class="tiles-label">Tiles</span><span class="tiles-n"></span>`
   tilesBtn.title = "Every running session's chat, side by side (T)"
   tilesBtn.addEventListener("click", () => (tiles.isOpen ? tiles.close() : openTiles()))
   const ac = new AbortController()
-  right.append(autoApproveToggle(store, { signal: ac.signal }), tilesBtn)
+  right.append(autoApproveToggle(store, { signal: ac.signal }), orchLink, tilesBtn)
   const stopNotices = autoApprovedNotices(store)
   const newBtn = el("button", "new-btn") as HTMLButtonElement
   newBtn.type = "button"
@@ -358,6 +614,116 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
   right.append(help)
   top.append(brand, search, right)
 
+  // ---- active filter / search bar ----
+  const filterBanner = el("div", "filter-banner")
+  filterBanner.hidden = true
+  const filterText = el("span", "filter-banner-text")
+  const filterClear = el("button", "filter-banner-clear", "Clear (Esc)") as HTMLButtonElement
+  filterClear.type = "button"
+  filterClear.addEventListener("click", () => {
+    if (searchInput.value) {
+      searchInput.value = ""
+      search.classList.remove("has-value")
+      root.classList.remove("searching")
+      canvas.setQuery("")
+    }
+    if (canvas.filter) setFilter(undefined)
+    updateFilterBanner()
+  })
+  filterBanner.append(filterText, filterClear)
+  updateFilterBanner = () => {
+    const summary = activeFilterSummary(canvas.filter, searchInput.value, visibleSessionCount)
+    filterBanner.hidden = !summary
+    if (summary) filterText.textContent = summary
+  }
+
+  // ---- collapsible projects navigator (spatial jump list) ----
+  const projWrap = el("aside", "proj-wrap")
+  projWrap.setAttribute("aria-label", "Projects navigator")
+  const projToggle = el("button", "proj-toggle") as HTMLButtonElement
+  projToggle.type = "button"
+  projToggle.setAttribute("aria-expanded", "false")
+  projToggle.title = "Jump to any project on the canvas (P)"
+  const projToggleDot = el("span", "proj-toggle-dot")
+  projToggleDot.setAttribute("aria-hidden", "true")
+  const projToggleLabel = el("span", "proj-toggle-label", "Projects")
+  const projToggleCount = el("span", "proj-toggle-count", "0")
+  projToggle.append(projToggleDot, projToggleLabel, projToggleCount)
+
+  const projDrawer = el("div", "proj-drawer")
+  projDrawer.hidden = true
+  const projHead = el("div", "proj-drawer-head")
+  const projTitle = el("span", "proj-drawer-title", "Projects on canvas")
+  const projFitBtn = el("button", "proj-fit-btn", "Fit all") as HTMLButtonElement
+  projFitBtn.type = "button"
+  projFitBtn.title = "Fit every project in view (0)"
+  projFitBtn.addEventListener("click", () => canvas.fitAll())
+  projHead.append(projTitle, projFitBtn)
+  const projList = el("div", "proj-list")
+  projDrawer.append(projHead, projList)
+  projWrap.append(projToggle, projDrawer)
+
+  let projOpen = false
+  const setProjOpen = (open: boolean) => {
+    projOpen = open
+    projDrawer.hidden = !open
+    projWrap.classList.toggle("open", open)
+    projToggle.setAttribute("aria-expanded", String(open))
+  }
+  projToggle.addEventListener("click", (e) => {
+    e.stopPropagation()
+    setProjOpen(!projOpen)
+  })
+
+  const renderProjectsNav = () => {
+    const groups = summarizeProjectGroups(store)
+    projToggleCount.textContent = String(groups.length)
+    const hasNeeds = groups.some((g) => g.needsYou > 0)
+    const hasWork = groups.some((g) => g.working > 0)
+    projToggleDot.dataset.priority = hasNeeds ? "needs-you" : hasWork ? "working" : "idle"
+    projWrap.hidden = groups.length === 0
+    projList.replaceChildren(
+      ...groups.map((g) => {
+        const row = el("div", `proj-item p-${g.priority}`)
+        const btn = el("button", "proj-item-btn") as HTMLButtonElement
+        btn.type = "button"
+        btn.title = `${g.directory} · click to jump to this project`
+        const dotEl = el("span", `proj-dot ${g.priority}`)
+        dotEl.setAttribute("aria-hidden", "true")
+        const nameEl = el("span", "proj-name", g.label)
+        const metaEl = el("span", "proj-meta")
+        const metaBits: string[] = []
+        if (g.needsYou) metaBits.push(`${g.needsYou} ask`)
+        if (g.working) metaBits.push(`${g.working} live`)
+        if (g.review) metaBits.push(`${g.review} rev`)
+        metaEl.textContent = metaBits.length ? metaBits.join(" · ") : `${g.total}`
+        btn.append(dotEl, nameEl, metaEl)
+        btn.addEventListener("click", () => {
+          if (canvas.filter) setFilter(undefined)
+          if (searchInput.value) {
+            searchInput.value = ""
+            search.classList.remove("has-value")
+            root.classList.remove("searching")
+            canvas.setQuery("")
+          }
+          canvas.focusGroup(g.key)
+          if (typeof innerWidth === "number" && innerWidth < 900) setProjOpen(false)
+        })
+        const addBtn = el("button", "proj-add", "+") as HTMLButtonElement
+        addBtn.type = "button"
+        addBtn.title = `New session in ${g.label}`
+        addBtn.setAttribute("aria-label", `New session in ${g.label}`)
+        addBtn.addEventListener("click", (e) => {
+          e.stopPropagation()
+          void createIn(g.directory)
+        })
+        row.append(btn, addBtn)
+        return row
+      }),
+    )
+  }
+
+  // ---- streamlined bottom dock (Layout + Style popover) ----
   const dock = el("div", "dock")
   const layoutSeg = segmented(LAYOUTS, LAYOUT_LABEL, layoutName, (v) => setLayout(v), "Layout")
   const spinSeg = segmented(SPINNERS, SPINNER_LABEL, spinnerStyle, (v) => setSpinner(v), "Spinner")
@@ -373,8 +739,87 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     b.prepend(spinner(12, "seg-spin", SPINNERS[i]))
     b.classList.add("with-spin")
   })
-  dock.append(layoutSeg.group, el("span", "dock-sep"), spinSeg.group, el("span", "dock-sep"), wallSeg.group)
-  root.append(top, dock)
+
+  const styleWrap = el("div", "dock-style-wrap")
+  const styleBtn = el("button", "dock-style-btn") as HTMLButtonElement
+  styleBtn.type = "button"
+  styleBtn.innerHTML = `<span class="ds-label">Style</span><span class="ds-caret" aria-hidden="true">▾</span>`
+  styleBtn.title = "Spinner animation & canvas wallpaper"
+  styleBtn.setAttribute("aria-haspopup", "dialog")
+  styleBtn.setAttribute("aria-expanded", "false")
+  const stylePop = el("div", "dock-style-pop")
+  stylePop.setAttribute("role", "dialog")
+  stylePop.setAttribute("aria-label", "Canvas appearance")
+  stylePop.hidden = true
+  stylePop.append(spinSeg.group, wallSeg.group)
+  styleWrap.append(styleBtn, stylePop)
+
+  let styleOpen = false
+  function closeStylePop() {
+    if (!styleOpen) return
+    styleOpen = false
+    stylePop.hidden = true
+    styleWrap.classList.remove("open")
+    styleBtn.setAttribute("aria-expanded", "false")
+  }
+  styleBtn.addEventListener("click", (e) => {
+    e.stopPropagation()
+    styleOpen = !styleOpen
+    stylePop.hidden = !styleOpen
+    styleWrap.classList.toggle("open", styleOpen)
+    styleBtn.setAttribute("aria-expanded", String(styleOpen))
+  })
+  stylePop.addEventListener("pointerdown", (e) => e.stopPropagation())
+  styleBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
+  document.addEventListener("pointerdown", closeStylePop, { signal: ac.signal })
+
+  dock.append(layoutSeg.group, el("span", "dock-sep"), styleWrap)
+
+  // ---- bottom-right canvas HUD (attention jump + zoom controls) ----
+  const hud = el("div", "canvas-hud")
+  hud.setAttribute("aria-label", "Canvas navigation")
+  const hudAttn = el("button", "hud-btn hud-attn") as HTMLButtonElement
+  hudAttn.type = "button"
+  hudAttn.title = "Jump to next session needing attention (])"
+  const hudAttnDot = el("span", "hud-attn-dot")
+  hudAttnDot.setAttribute("aria-hidden", "true")
+  const hudAttnLabel = el("span", "hud-attn-label", "Next")
+  hudAttn.append(hudAttnDot, hudAttnLabel)
+  hudAttn.addEventListener("click", () => jumpAttention(1))
+
+  const zoomOutBtn = el("button", "hud-btn hud-zoom-step", "−") as HTMLButtonElement
+  zoomOutBtn.type = "button"
+  zoomOutBtn.title = "Zoom out (-)"
+  zoomOutBtn.setAttribute("aria-label", "Zoom out")
+  zoomOutBtn.addEventListener("click", () => canvas.zoomBy(0.8))
+
+  zoomReadout = el("button", "hud-btn hud-zoom-val", formatZoomPercent(canvas.camera.z)) as HTMLButtonElement
+  zoomReadout.type = "button"
+  zoomReadout.title = "Fit all sessions (0)"
+  zoomReadout.setAttribute("aria-label", "Reset zoom and fit all sessions")
+  zoomReadout.addEventListener("click", () => canvas.fitAll())
+
+  const zoomInBtn = el("button", "hud-btn hud-zoom-step", "+") as HTMLButtonElement
+  zoomInBtn.type = "button"
+  zoomInBtn.title = "Zoom in (+)"
+  zoomInBtn.setAttribute("aria-label", "Zoom in")
+  zoomInBtn.addEventListener("click", () => canvas.zoomBy(1.25))
+
+  const fitBtn = el("button", "hud-btn hud-fit", "Fit") as HTMLButtonElement
+  fitBtn.type = "button"
+  fitBtn.title = "Fit everything in view (0)"
+  fitBtn.setAttribute("aria-label", "Fit everything")
+  fitBtn.addEventListener("click", () => canvas.fitAll())
+
+  const cmdkBtn = el("button", "hud-btn hud-cmdk", "⌘K") as HTMLButtonElement
+  cmdkBtn.type = "button"
+  cmdkBtn.title = "Command palette — jump to any session, project, or action (⌘K)"
+  cmdkBtn.setAttribute("aria-label", "Open command palette")
+  cmdkBtn.addEventListener("click", () => palette.open())
+
+  hud.append(hudAttn, el("span", "hud-sep"), cmdkBtn, el("span", "hud-sep"), zoomOutBtn, zoomReadout, zoomInBtn, fitBtn)
+
+  root.append(top, filterBanner, projWrap, dock, hud)
 
   function setWallpaper(v: WallpaperId) {
     wallpaper = v
@@ -401,8 +846,13 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
   let searchTimer: ReturnType<typeof setTimeout> | undefined
   searchInput.addEventListener("input", () => {
     clearTimeout(searchTimer)
-    searchTimer = setTimeout(() => canvas.setQuery(searchInput.value), 90)
-    search.classList.toggle("has-value", !!searchInput.value)
+    searchTimer = setTimeout(() => {
+      canvas.setQuery(searchInput.value)
+      updateFilterBanner()
+    }, 90)
+    const hasVal = !!searchInput.value
+    search.classList.toggle("has-value", hasVal)
+    root.classList.toggle("searching", !!searchInput.value.trim())
   })
   searchInput.addEventListener("keydown", (e) => {
     e.stopPropagation()
@@ -411,6 +861,8 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
         searchInput.value = ""
         canvas.setQuery("")
         search.classList.remove("has-value")
+        root.classList.remove("searching")
+        updateFilterBanner()
       } else searchInput.blur()
     } else if (e.key === "Enter" || e.key === "ArrowDown") {
       e.preventDefault()
@@ -437,6 +889,21 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     tilesBtn.querySelector(".tiles-n")!.textContent = live ? String(live) : ""
     tilesBtn.classList.toggle("on", tiles.isOpen)
     tilesBtn.classList.toggle("live", counts.working + counts["needs-you"] > 0)
+    orchLink.classList.toggle("on", orchestrator.isOpen)
+
+    const attn = buildAttentionQueue(store, (id) => canvas.hasSession(id))
+    hudAttn.hidden = attn.ids.length === 0
+    hudAttn.classList.toggle("urgent", attn.needsYou > 0)
+    hudAttnLabel.textContent =
+      attn.needsYou > 0
+        ? `Needs you (${attn.needsYou})`
+        : attn.review > 0
+          ? `Review (${attn.review})`
+          : `Live (${attn.working})`
+
+    renderProjectsNav()
+    updateFilterBanner()
+
     // The tab title says what needs you, even from another tab.
     const bits: string[] = []
     if (counts["needs-you"]) bits.push(`${counts["needs-you"]} need${counts["needs-you"] === 1 ? "s" : ""} you`)
@@ -478,13 +945,16 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
         <dt>← ↑ → ↓</dt><dd>Move between sessions</dd>
         <dt>Enter · click</dt><dd>Open a stack or session</dd>
         <dt>Esc</dt><dd>Step back one level</dd>
-        <dt>/ · ⌘K · type</dt><dd>Search</dd>
+        <dt>⌘K · Ctrl+K</dt><dd>Command palette: jump to any session, project, or action</dd>
+        <dt>/ · type</dt><dd>Filter sessions on canvas</dd>
         <dt>1 – 4</dt><dd>Satellites, Fold, Tabs, Tree</dd>
         <dt>0 · double-click</dt><dd>Fit everything</dd>
         <dt>N</dt><dd>New session: pick a project or type a folder path</dd>
         <dt>L</dt><dd>Launch a task: type a prompt in the chat box, Enter starts it</dd>
+        <dt>P</dt><dd>Toggle the Projects navigator to jump between projects</dd>
+        <dt>O</dt><dd>Orchestrate: control multiple sessions from one unified chat</dd>
         <dt>T</dt><dd>Tiles: every running session's chat side by side</dd>
-        <dt>] · [</dt><dd>Next / previous session that needs you, then to review, then working</dd>
+        <dt>] · [</dt><dd>Next / previous session (works on canvas and inside an open session)</dd>
       </dl>
       <h2>Status</h2>
       <dl class="legend">
@@ -517,18 +987,9 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
   }
 
   function jumpAttention(dir: 1 | -1) {
-    const t = Date.now()
-    const order: Status[] = ["needs-you", "review", "working"]
-    const list = order.flatMap((st) =>
-      store
-        .roots()
-        .filter((s) => store.inFilter(s.id, st, t) && canvas.hasSession(s.id))
-        .sort((a, b) => b.time.updated - a.time.updated)
-        .map((s) => s.id),
-    )
-    if (!list.length) return toast("Nothing needs you right now")
-    const i = canvas.selected ? list.indexOf(canvas.selected) : -1
-    const next = list[(i + dir + list.length) % list.length]
+    const q = buildAttentionQueue(store, (id) => canvas.hasSession(id))
+    const next = nextAttentionId(q.ids, canvas.selected, dir)
+    if (!next) return toast("Nothing needs you right now")
     canvas.select(next, false)
     canvas.centerOn(next, Math.max(0.8, canvas.camera.z))
   }
@@ -536,6 +997,19 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
   // ---- keyboard ----
 
   const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "k" && (e.metaKey || e.ctrlKey) && !e.altKey) {
+      e.preventDefault()
+      if (helpEl) toggleHelp()
+      palette.toggle()
+      return
+    }
+    if (palette.isOpen) {
+      if (e.key === "Escape") {
+        e.preventDefault()
+        palette.handleEscape()
+      }
+      return
+    }
     if (picker.isOpen) {
       if (e.key === "Escape") {
         e.preventDefault()
@@ -559,36 +1033,51 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
       }
     }
     if (e.key === "Escape") {
+      if (palette.handleEscape()) return
       if (helpEl) return toggleHelp()
       if (launchpad?.closeOpenMenu()) return
+      if (styleOpen) return closeStylePop()
       if (panel.handleEscape()) return
+      if (orchestrator.handleEscape()) return
       if (tiles.isOpen) {
         if (tiles.maximized) return tiles.toggleMax(tiles.maximized)
         return tiles.close()
       }
+      if (projOpen) return setProjOpen(false)
       if (searchInput.value) {
         searchInput.value = ""
         search.classList.remove("has-value")
-        return canvas.setQuery("")
+        root.classList.remove("searching")
+        canvas.setQuery("")
+        return updateFilterBanner()
       }
       if (canvas.filter) return setFilter(undefined)
       if (canvas.closeStack()) return
       return canvas.select(undefined)
     }
     if (panel.isOpen) {
+      if ((e.key === "]" || e.key === "[") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault()
+        panel.onStep?.(e.key === "]" ? 1 : -1)
+        return
+      }
       const interactive = target?.closest("button, a, [role='button'], [role='menuitem'], summary")
       if (!interactive && e.key.length === 1 && e.key !== " " && !e.metaKey && !e.ctrlKey && !e.altKey) {
         panel.focusInput()
       }
       return
     }
+    if ((e.key === "o" || e.key === "O") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault()
+      return orchestrator.isOpen ? orchestrator.close() : openOrchestrator()
+    }
     if ((e.key === "t" || e.key === "T") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault()
       return tiles.isOpen ? tiles.close() : openTiles()
     }
-    // The canvas shortcuts below don't apply on the tiled view.
-    if (tiles.isOpen) return
-    if ((e.key === "k" && (e.metaKey || e.ctrlKey)) || e.key === "/") {
+    // The canvas shortcuts below don't apply on the tiled or orchestrator views.
+    if (tiles.isOpen || orchestrator.isOpen) return
+    if (e.key === "/") {
       e.preventDefault()
       searchInput.focus()
       searchInput.select()
@@ -633,6 +1122,10 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
       e.preventDefault()
       return launchpad?.focus()
     }
+    if (e.key === "p" || e.key === "P") {
+      e.preventDefault()
+      return setProjOpen(!projOpen)
+    }
     if (e.key === "?") return toggleHelp()
     // Jump between sessions that want attention: needs you, then review, then working.
     if (e.key === "]" || e.key === "[") return jumpAttention(e.key === "]" ? 1 : -1)
@@ -654,9 +1147,11 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     store.stop()
     helpEl?.remove()
     helpEl = undefined
+    palette.destroy()
     picker.close(false)
     panel.destroy()
     launchpad?.destroy()
+    orchestrator.destroy()
     tiles.destroy()
     canvas.destroy()
   }
@@ -669,14 +1164,15 @@ export async function boot(rootEl?: HTMLElement): Promise<BootHandle | undefined
     return undefined
   }
 
-  if (destroyed) return { store, canvas, panel, tiles, picker, launchpad, destroy }
+  if (destroyed) return { store, canvas, panel, tiles, orchestrator, picker, launchpad, destroy }
 
-  // Deep links: /#tiles, /#ses_…
+  // Deep links: /orchestrate, /#orchestrate, /#tiles, /#ses_…
   const hash = location.hash.slice(1)
-  if (hash === "tiles") openTiles()
+  if (location.pathname === "/orchestrate" || hash === "orchestrate") openOrchestrator()
+  else if (hash === "tiles") openTiles()
   else if (hash && store.sessions.has(hash)) requestAnimationFrame(() => requestAnimationFrame(() => openSession(hash)))
 
-  return { store, canvas, panel, tiles, picker, launchpad, destroy }
+  return { store, canvas, panel, tiles, orchestrator, picker, launchpad, destroy }
 }
 
 if (typeof document !== "undefined" && document.getElementById("app") && !(globalThis as any).__HERMES_TEST__) {
